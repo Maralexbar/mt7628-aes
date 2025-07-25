@@ -1,4 +1,12 @@
-#include <crypto/internal/skcipher.h>
+/*
+ * For verbose debug messages, compile with DEBUG flag
+ * or enable dynamic debug for this module.
+ *
+ * Example:
+ * echo 'file mtk-aes-engine.c +p' > /sys/kernel/debug/dynamic_debug/control
+ */
+#define DEBUG
+
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -9,245 +17,160 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
-#include <linux/types.h>
-#include <linux/version.h>
+#include <linux/reset.h>
+#include <crypto/skcipher.h>
+#include <crypto/internal/skcipher.h>
 
 #include "mtk-aes-engine.h"
 
 static void aes_engine_start(struct mtk_dev *mtk)
 {
-	u32 regVal;
-	u32 AES_glo_cfg = 0;
+	u32 reg_val;
+	u32 aes_glo_cfg = 0;
 
-	AES_glo_cfg = (AES_TX_DMA_EN | AES_RX_DMA_EN | AES_TX_WB_DDONE
-		| AES_DESC_5DW_INFO_EN | AES_RX_ANYBYTE_ALIGN);
+	dev_dbg(mtk->dev, "Starting hardware engine...");
+
+	aes_glo_cfg = (AES_TX_DMA_EN | AES_RX_DMA_EN | AES_TX_WB_DDONE |
+		       AES_DESC_5DW_INFO_EN | AES_RX_ANYBYTE_ALIGN);
 
 	writel(AES_DLY_INIT_VALUE, mtk->base + AES_DLY_INT_CFG);
+	/* Clear any pending interrupts */
 	writel(AES_MASK_INT_ALL, mtk->base + AES_INT_STATUS);
-	regVal = readl(mtk->base + AES_INT_STATUS);
+	reg_val = readl(mtk->base + AES_INT_STATUS);
+	/* Enable interrupts */
 	writel(AES_MASK_INT_ALL, mtk->base + AES_INT_MASK);
 
-	AES_glo_cfg |= AES_BT_SIZE_16DWORDS;
-	writel(AES_glo_cfg, mtk->base + AES_GLO_CFG);
-}
+	aes_glo_cfg |= AES_BT_SIZE_16DWORDS;
+	writel(aes_glo_cfg, mtk->base + AES_GLO_CFG);
 
-static void aes_engine_reset(void)
-{
-	u32 val;
-
-	val = readl(REG_CLKCTRL);
-	val |= RALINK_CRYPTO_CLK_EN;
-	writel(val, REG_CLKCTRL);
-
-	udelay(10);
-
-	val = readl(REG_RSTCTRL);
-	val |= RALINK_CRYPTO_RST;
-	writel(val, REG_RSTCTRL);
-
-	udelay(10);
-
-	val &= ~(RALINK_CRYPTO_RST);
-	writel(val, REG_RSTCTRL);
-
-	udelay(100);
+	dev_dbg(mtk->dev, "AES_GLO_CFG set to 0x%08x", aes_glo_cfg);
 }
 
 static void aes_engine_stop(struct mtk_dev *mtk)
 {
 	int i;
-	u32 regVal;
+	u32 reg_val;
 
-	regVal = readl(mtk->base + AES_GLO_CFG);
-	regVal &= ~(AES_TX_WB_DDONE | AES_RX_DMA_EN | AES_TX_DMA_EN);
-	writel(regVal, mtk->base + AES_GLO_CFG);
+	dev_dbg(mtk->dev, "Stopping hardware engine...");
 
-	/* wait AES stopped */
+	reg_val = readl(mtk->base + AES_GLO_CFG);
+	reg_val &= ~(AES_TX_WB_DDONE | AES_RX_DMA_EN | AES_TX_DMA_EN);
+	writel(reg_val, mtk->base + AES_GLO_CFG);
+
+	/* Wait for AES engine to stop */
 	for (i = 0; i < 50; i++) {
-		msleep(1);
-		regVal = readl(mtk->base + AES_GLO_CFG);
-		if (!(regVal & (AES_RX_DMA_BUSY | AES_TX_DMA_BUSY)))
+		if (!(readl(mtk->base + AES_GLO_CFG) &
+		      (AES_RX_DMA_BUSY | AES_TX_DMA_BUSY))) {
+			dev_dbg(mtk->dev, "Engine stopped.");
 			break;
+		}
+		msleep(1);
 	}
-	/* disable AES interrupt */
+	if (i == 50)
+		dev_warn(mtk->dev, "Timeout waiting for engine to stop!\n");
+
+	/* Disable AES interrupt */
 	writel(0, mtk->base + AES_INT_MASK);
 }
 
-/* Allocate Descriptor rings */
 static int aes_engine_desc_init(struct mtk_dev *mtk)
 {
-	u32 regVal;
+	u32 reg_val;
 	int i;
 	size_t size;
 
+	dev_dbg(mtk->dev, "Initializing descriptor rings...");
+
 	size = (MTK_RING_SIZE * sizeof(struct aes_txdesc));
-
-	mtk->tx = dma_zalloc_coherent(mtk->dev, size,
-					&mtk->phy_tx, GFP_KERNEL);
+	mtk->tx = dma_alloc_coherent(mtk->dev, size, &mtk->phy_tx, GFP_KERNEL);
 	if (!mtk->tx)
-		goto err_cleanup;
-
-	dev_info(mtk->dev, "TX Ring : %08X\n", mtk->phy_tx);
+		return -ENOMEM;
 
 	size = (MTK_RING_SIZE * sizeof(struct aes_rxdesc));
-
-	mtk->rx = dma_zalloc_coherent(mtk->dev, size,
-					&mtk->phy_rx, GFP_KERNEL);
+	mtk->rx = dma_alloc_coherent(mtk->dev, size, &mtk->phy_rx, GFP_KERNEL);
 	if (!mtk->rx)
-		goto err_cleanup;
-
-	dev_info(mtk->dev, "RX Ring : %08X\n", mtk->phy_rx);
+		goto err_free_tx;
 
 	size = (MTK_RING_SIZE * sizeof(struct mtk_dma_rec));
-
-	mtk->rec = dma_zalloc_coherent(mtk->dev, size,
-					&mtk->phy_rec,  GFP_KERNEL);
-
+	mtk->rec = devm_kzalloc(mtk->dev, size, GFP_KERNEL);
 	if (!mtk->rec)
-		goto err_cleanup;
+		goto err_free_rx;
 
-	dev_info(mtk->dev, "Rec Ring : %08X\n", mtk->phy_rec);
+	dev_dbg(mtk->dev, "Rings allocated (TX: %pad, RX: %pad)",
+		&mtk->phy_tx, &mtk->phy_rx);
 
 	for (i = 0; i < MTK_RING_SIZE; i++)
 		mtk->tx[i].txd_info2 |= TX2_DMA_DONE;
 
-	regVal = readl(mtk->base + AES_GLO_CFG);
-	regVal &= 0x00000ff0;
-	writel(regVal, mtk->base + AES_GLO_CFG);
-	regVal = readl(mtk->base + AES_GLO_CFG);
+	reg_val = readl(mtk->base + AES_GLO_CFG);
+	reg_val &= 0x00000ff0;
+	writel(reg_val, mtk->base + AES_GLO_CFG);
 
 	writel((u32)mtk->phy_tx, mtk->base + AES_TX_BASE_PTR0);
 	writel((u32)MTK_RING_SIZE, mtk->base + AES_TX_MAX_CNT0);
 	writel(0, mtk->base + AES_TX_CTX_IDX0);
-
-	regVal = readl(mtk->base + AES_TX_CTX_IDX0);
-
 	writel(AES_PST_DTX_IDX0, mtk->base + AES_RST_CFG);
 
 	writel((u32)mtk->phy_rx, mtk->base + AES_RX_BASE_PTR0);
 	writel((u32)MTK_RING_SIZE, mtk->base + AES_RX_MAX_CNT0);
 	writel((u32)(MTK_RING_SIZE - 1), mtk->base + AES_RX_CALC_IDX0);
-	regVal = readl(mtk->base + AES_RX_CALC_IDX0);
 
-	mtk->rec_rear_idx = MTK_RING_SIZE - 1;
+	mtk->rec_rear_idx = 0;
 	mtk->rec_front_idx = 0;
 	mtk->count = 0;
 
 	writel(AES_PST_DRX_IDX0, mtk->base + AES_RST_CFG);
 
+	dev_dbg(mtk->dev, "Descriptor rings initialized.");
 	return 0;
-err_cleanup:
+
+err_free_rx:
+	dma_free_coherent(mtk->dev, MTK_RING_SIZE * sizeof(struct aes_rxdesc),
+			  mtk->rx, mtk->phy_rx);
+	mtk->rx = NULL;
+err_free_tx:
+	dma_free_coherent(mtk->dev, MTK_RING_SIZE * sizeof(struct aes_txdesc),
+			  mtk->tx, mtk->phy_tx);
+	mtk->tx = NULL;
 	return -ENOMEM;
 }
 
-/* Free Descriptor Rings */
 static void aes_engine_desc_free(struct mtk_dev *mtk)
 {
-	size_t	size;
-
+	dev_dbg(mtk->dev, "Freeing descriptor rings...");
 	writel(0, mtk->base + AES_TX_BASE_PTR0);
 	writel(0, mtk->base + AES_RX_BASE_PTR0);
 
-	size = MTK_RING_SIZE * sizeof(struct aes_txdesc);
-
 	if (mtk->tx) {
-		dma_free_coherent(mtk->dev, size, mtk->tx, mtk->phy_tx);
+		dma_free_coherent(mtk->dev,
+				  MTK_RING_SIZE * sizeof(struct aes_txdesc),
+				  mtk->tx, mtk->phy_tx);
 		mtk->tx = NULL;
-		mtk->phy_tx = 0;
 	}
-
-	size = MTK_RING_SIZE * sizeof(struct aes_rxdesc);
 
 	if (mtk->rx) {
-		dma_free_coherent(mtk->dev, size, mtk->rx, mtk->phy_rx);
+		dma_free_coherent(mtk->dev,
+				  MTK_RING_SIZE * sizeof(struct aes_rxdesc),
+				  mtk->rx, mtk->phy_rx);
 		mtk->rx = NULL;
-		mtk->phy_rx = 0;
 	}
-
-	size = MTK_RING_SIZE * sizeof(struct mtk_dma_rec);
-
-	if (mtk->rec) {
-		dma_free_coherent(mtk->dev, size, mtk->rec, mtk->phy_rec);
-		mtk->rec = NULL;
-		mtk->phy_rec = 0;
-	}
+	dev_dbg(mtk->dev, "Descriptor rings freed.");
 }
 
-static int mtk_combine_scatter(struct mtk_dev *mtk, struct scatterlist *sgsrc,
-			struct scatterlist *sgdst, int total)
+static int mtk_aes_xmit(struct skcipher_request *req)
 {
-	struct mtk_dma_rec *rec;
-	unsigned int remainin, remainout;
-	int offsetin = 0;
-	int offsetout = 0;
-	struct scatterlist *sgin, *sgout;
-	int ctr;
-	unsigned int len;
-	int count = 0;
-	bool nextin = false;
-	bool nextout = false;
-
-	sgin = sgsrc;
-	sgout = sgdst;
-	remainin = sgin->length;
-	remainout = sgout->length;
-	ctr = mtk->rec_rear_idx;
-
-	while (total > 0) {
-		if (nextin) {
-			sgin = sg_next(sgin);
-			remainin = sgin->length;
-			if (remainin == 0)
-				continue;
-			offsetin = 0;
-			nextin = false;
-		}
-		if (nextout) {
-			sgout = sg_next(sgout);
-			remainout = sgout->length;
-			if (remainout == 0)
-				continue;
-			offsetout = 0;
-			nextout = false;
-		}
-		count++;
-		ctr = (ctr + 1) % MTK_RING_SIZE;
-		rec = &mtk->rec[ctr];
-		rec->src = (unsigned int)(sg_virt(sgin) + offsetin);
-		rec->dst = (unsigned int)(sg_virt(sgout) + offsetout);
-		if (remainin == remainout) {
-			len = remainin;
-			nextin = true;
-			nextout = true;
-		} else if (remainin < remainout) {
-			len = remainin;
-			offsetout += len;
-			remainout -= len;
-			nextin = true;
-		} else {
-			len = remainout;
-			offsetin += len;
-			remainin -= len;
-			nextout = true;
-		}
-		total -= len;
-		rec->len = len;
-	}
-	return count;
-}
-
-int mtk_aes_xmit(struct ablkcipher_request *req)
-{
-	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
-	struct mtk_aes_ctx *ctx = crypto_ablkcipher_ctx(tfm);
-	struct mtk_aes_reqctx *rctx = ablkcipher_request_ctx(req);
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct mtk_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct mtk_aes_reqctx *rctx = skcipher_request_ctx(req);
 	struct mtk_dev *mtk = ctx->mtk;
-	struct aes_txdesc *txdesc;
-	struct aes_rxdesc *rxdesc;
+	struct aes_txdesc *txdesc = NULL;
+	struct aes_rxdesc *rxdesc = NULL;
 	struct mtk_dma_rec *rec;
 	u32 aes_txd_info4, info;
-	u32 ctr = 0, count, i;
+	u32 ctr, i;
 	unsigned long flags;
+	struct scatterlist *sg;
+	int nents;
 
 	if (!mtk)
 		return -ENODEV;
@@ -267,203 +190,131 @@ int mtk_aes_xmit(struct ablkcipher_request *req)
 	if (rctx->mode & CRYPTO_MODE_CBC)
 		aes_txd_info4 |= TX4_DMA_CBC | TX4_DMA_IVR;
 
-	count = mtk_combine_scatter(mtk, req->src, req->dst, req->nbytes);
+	nents = sg_nents_for_len(req->src, req->cryptlen);
+	if (nents < 0) {
+		dev_warn(mtk->dev, "Invalid S/G list for request\n");
+		spin_unlock_irqrestore(&mtk->lock, flags);
+		return nents;
+	}
+	dev_dbg(mtk->dev, "Transmitting request %p with %d S/G entries", req, nents);
 
-	for (i = 0; i < count; i++) {
-		ctr = (mtk->rec_rear_idx + i + 1) % MTK_RING_SIZE;
+	for_each_sg(req->src, sg, nents, i) {
+		ctr = (mtk->rec_rear_idx + i) % MTK_RING_SIZE;
 		txdesc = &mtk->tx[ctr];
 		rxdesc = &mtk->rx[ctr];
 		rec = &mtk->rec[ctr];
-		rec->req = (void *)req;
+		rec->req = req;
 		info = aes_txd_info4;
 
 		if ((rctx->mode & CRYPTO_MODE_CBC) && (i == 0)) {
-			if (!req->info)
-				memset((void *)txdesc->IV, 0xFF, 16);
-			else
-				memcpy((void *)txdesc->IV, (void *)req->info, 16);
-
+			memcpy(txdesc->iv, req->iv, AES_BLOCK_SIZE);
 			info |= TX4_DMA_KIU;
 		}
 		txdesc->txd_info4 = info;
 
 		if (i == 0) {
-			txdesc->SDP0 = (u32)(void *)ctx->phy_key;
+			txdesc->sdp0 = (u32)ctx->phy_key;
 			txdesc->txd_info2 = TX2_DMA_SDL0_SET(ctx->keylen);
 		} else {
 			txdesc->txd_info2 = 0;
 		}
 
-		txdesc->SDP1 = (u32)dma_map_single(mtk->dev, (void *)rec->src,
-				rec->len, DMA_BIDIRECTIONAL);
-
+		rec->src = sg_dma_address(sg);
+		rec->len = sg_dma_len(sg);
+		txdesc->sdp1 = (u32)rec->src;
 		txdesc->txd_info2 |= TX2_DMA_SDL1_SET(rec->len);
 
-		rxdesc->SDP0 = (u32)dma_map_single(mtk->dev, (void *)rec->dst,
-				rec->len, DMA_BIDIRECTIONAL);
-
+		rec->dst = sg_dma_address(sg_next(req->dst));
+		rxdesc->sdp0 = (u32)rec->dst;
 		rxdesc->rxd_info2 = RX2_DMA_SDL0_SET(rec->len);
+
+		dev_dbg(mtk->dev, "  desc[%u]: src=%pad, dst=%pad, len=%zu",
+			ctr, &rec->src, &rec->dst, rec->len);
 	}
-	txdesc->txd_info2 |= TX2_DMA_LS1;
-	rxdesc->rxd_info2 |= RX2_DMA_LS0;
-	mtk->rec_rear_idx = (mtk->rec_rear_idx + count) % MTK_RING_SIZE;
-	ctr = (mtk->rec_rear_idx + 1) % MTK_RING_SIZE;
+
+	if (txdesc && rxdesc) {
+		/* Mark last descriptors */
+		txdesc->txd_info2 |= TX2_DMA_LS1;
+		rxdesc->rxd_info2 |= RX2_DMA_LS0;
+	}
+
+	mtk->rec_rear_idx = (mtk->rec_rear_idx + nents) % MTK_RING_SIZE;
+	ctr = mtk->rec_rear_idx;
+
 	spin_unlock_irqrestore(&mtk->lock, flags);
-	/*
-	 * Make sure all data is updated before starting engine.
-	 */
-	wmb();
-	/* Writing new scattercount starts PDMA action */
+
+	wmb(); /* Ensure all descriptor changes are written */
+	dev_dbg(mtk->dev, "Setting TX_CTX_IDX to %u", ctr);
 	writel(ctr, mtk->base + AES_TX_CTX_IDX0);
-	return 0;
+	return -EINPROGRESS;
 }
 
-int mtk_handle_request(struct ablkcipher_request *req)
+static void mtk_tasklet_req_done(struct tasklet_struct *t)
 {
-	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
-	struct mtk_aes_ctx *ctx = crypto_ablkcipher_ctx(tfm);
-	struct mtk_dev *mtk = ctx->mtk;
-	int ret = 0;
-
-	if (!mtk)
-		return -ENODEV;
-
-	/* assign new request to device */
-	ret = sg_nents_for_len(req->dst, req->nbytes);
-	if (ret < 0) {
-		dev_info(mtk->dev, "Invalid Dst SG\n");
-		return ret;
-	}
-
-	ret = sg_nents_for_len(req->src, req->nbytes);
-
-	if (ret < 0) {
-		dev_info(mtk->dev, "Invalid Src SG\n");
-		return ret;
-	}
-
-	ret = mtk_aes_xmit(req);
-
-	return ret;
-}
-
-int mtk_handle_queue(struct mtk_dev *mtk,
-			    struct ablkcipher_request *req)
-{
-	unsigned long flags;
-	int ret = 0, err;
-
-	spin_lock_irqsave(&mtk->lock, flags);
-
-	if (mtk->count > MTK_QUEUE_LENGTH) {
-		spin_unlock_irqrestore(&mtk->lock, flags);
-		return -EBUSY;
-	}
-	ret = -EINPROGRESS;
-	if (req)
-		mtk->count = mtk->count + 1;
-
-	spin_unlock_irqrestore(&mtk->lock, flags);
-
-	if (!req)
-		return 0;
-
-	err = mtk_handle_request(req);
-
-	if (err)
-		printk("Error: %d\n", err);
-
-	return ret;
-}
-
-static void mtk_tasklet_req_done(unsigned long data)
-{
-	struct mtk_dev *mtk = (struct mtk_dev *)data;
-	struct ablkcipher_request *req;
-	struct aes_txdesc *txdesc;
+	struct mtk_dev *mtk = from_tasklet(mtk, t, done_tasklet);
+	struct skcipher_request *req;
 	struct aes_rxdesc *rxdesc;
 	struct mtk_dma_rec *rec;
-	int ctr = 0;
-	u32 regVal;
-	int try_count;
+	unsigned long flags;
+	int ctr;
+	bool last;
 
-	if (mtk->count == 0)
-		return;
-
-get_next:
-	try_count = 0;
-	mtk->count = mtk->count - 1;
-
-	do {
-		regVal = readl(mtk->base + AES_GLO_CFG);
-
-		if (!(regVal & (AES_RX_DMA_BUSY | AES_TX_DMA_BUSY)))
-			break;
-		try_count++;
-		if (try_count > 1000000) {
-			dev_info(mtk->dev, "PDMA time-out: %d", try_count);
-			mtk->count = mtk->count + 1;
-			return; // -ETIMEDOUT;
-		}
-	} while (1);
+	dev_dbg(mtk, "Tasklet running, checking for completed requests...");
+	spin_lock_irqsave(&mtk->lock, flags);
 
 	ctr = mtk->rec_front_idx;
 
-	do {
+	while (mtk->count > 0) {
 		rxdesc = &mtk->rx[ctr];
-		txdesc = &mtk->tx[ctr];
-		rec = &mtk->rec[ctr];
 
 		if (!(rxdesc->rxd_info2 & RX2_DMA_DONE)) {
-			mtk->count = mtk->count + 1;
-			tasklet_schedule(&mtk->done_tasklet);
-			return;
+			dev_dbg(mtk, "Descriptor %d not done yet", ctr);
+			break; /* Not yet processed by hardware */
 		}
+
+		last = rxdesc->rxd_info2 & RX2_DMA_LS0;
+		rec = &mtk->rec[ctr];
+		req = rec->req;
 
 		rxdesc->rxd_info2 &= ~RX2_DMA_DONE;
 
-		dma_unmap_single(mtk->dev, (dma_addr_t)txdesc->SDP1, rec->len,
-				DMA_TO_DEVICE);
-
-		dma_unmap_single(mtk->dev, (dma_addr_t)rxdesc->SDP0, rec->len,
-				DMA_FROM_DEVICE);
-
-		txdesc->txd_info2 = 0;
-
-		if (rxdesc->rxd_info2 & RX2_DMA_LS0)
-			break;
+		if (last) {
+			dev_dbg(mtk, "Request %p completed, calling callback", req);
+			mtk->count--;
+			spin_unlock_irqrestore(&mtk->lock, flags);
+			req->base.complete(&req->base, 0);
+			spin_lock_irqsave(&mtk->lock, flags);
+		}
 
 		ctr = (ctr + 1) % MTK_RING_SIZE;
 
-	} while (1);
-
-	mtk->rec_front_idx = (ctr + 1) % MTK_RING_SIZE;
-	req = (struct ablkcipher_request *)rec->req;
-	writel(ctr, mtk->base + AES_RX_CALC_IDX0);
-	req->base.complete(&req->base, 0);
-
-	if (mtk->count > 0) {
-		goto get_next;
+		if (last)
+			break;
 	}
 
-	return;
+	mtk->rec_front_idx = ctr;
+	writel((ctr - 1) % MTK_RING_SIZE, mtk->base + AES_RX_CALC_IDX0);
+
+	spin_unlock_irqrestore(&mtk->lock, flags);
 }
 
 static irqreturn_t mtk_aes_irq(int irq, void *arg)
 {
 	struct mtk_dev *mtk = arg;
-	u32 regVal;
+	u32 reg_val;
 
-	regVal = readl(mtk->base + AES_GLO_CFG);
-
-	if ((regVal & (AES_RX_DMA_EN | AES_TX_DMA_EN))
-		!= (AES_RX_DMA_EN | AES_TX_DMA_EN)) {
-		dev_err(mtk->dev, "No active DMA on interrupt!");
+	reg_val = readl(mtk->base + AES_INT_STATUS);
+	if (!reg_val)
 		return IRQ_NONE;
-	}
-	tasklet_schedule(&mtk->done_tasklet);
 
-	writel(AES_MASK_INT_ALL, mtk->base + AES_INT_STATUS);
+	dev_dbg(mtk->dev, "IRQ received, status: 0x%08x", reg_val);
+
+	/* Disable interrupts, clear status, then schedule tasklet */
+	writel(0, mtk->base + AES_INT_MASK);
+	writel(reg_val, mtk->base + AES_INT_STATUS);
+	tasklet_schedule(&mtk->done_tasklet);
+	/* Re-enable interrupts */
+	writel(AES_MASK_INT_ALL, mtk->base + AES_INT_MASK);
 
 	return IRQ_HANDLED;
 }
@@ -488,177 +339,194 @@ static struct mtk_dev *mtk_aes_find_dev(struct mtk_aes_ctx *ctx)
 	return mtk;
 }
 
-static int mtk_aes_crypt(struct ablkcipher_request *req, unsigned int mode)
+static int mtk_aes_crypt(struct skcipher_request *req, unsigned int mode)
 {
-	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
-	struct mtk_aes_ctx *ctx = crypto_ablkcipher_ctx(tfm);
-	struct mtk_aes_reqctx *rctx = ablkcipher_request_ctx(req);
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct mtk_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct mtk_aes_reqctx *rctx = skcipher_request_ctx(req);
 	struct mtk_dev *mtk;
 	int ret;
-
-	if (req->nbytes < NUM_AES_BYPASS) {
-		SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback);
-
-		skcipher_request_set_tfm(subreq, ctx->fallback);
-		skcipher_request_set_callback(subreq, req->base.flags, NULL,
-					      NULL);
-		skcipher_request_set_crypt(subreq, req->src, req->dst,
-					   req->nbytes, req->info);
-
-		if (mode & CRYPTO_MODE_ENC)
-			ret = crypto_skcipher_encrypt(subreq);
-		else
-			ret = crypto_skcipher_decrypt(subreq);
-
-		skcipher_request_zero(subreq);
-		return ret;
-	}
+	unsigned long flags;
 
 	mtk = mtk_aes_find_dev(ctx);
-
-	if (!mtk)
+	if (!mtk) {
+		pr_warn("mtk-aes: crypt() called without initialized device\n");
 		return -ENODEV;
+	}
+
+	/* Fallback for small requests */
+	if (req->cryptlen < NUM_AES_BYPASS) {
+		dev_dbg(mtk->dev, "Request len %u < %d, using fallback",
+			req->cryptlen, NUM_AES_BYPASS);
+
+		{
+			struct skcipher_request *subreq;
+
+			subreq = skcipher_request_alloc(ctx->fallback, GFP_ATOMIC);
+			if (!subreq)
+				return -ENOMEM;
+
+			skcipher_request_set_tfm(subreq, ctx->fallback);
+			skcipher_request_set_callback(subreq, req->base.flags, NULL, NULL);
+			skcipher_request_set_crypt(subreq, req->src, req->dst,
+						   req->cryptlen, req->iv);
+			if (mode & CRYPTO_MODE_ENC)
+				ret = crypto_skcipher_encrypt(subreq);
+			else
+				ret = crypto_skcipher_decrypt(subreq);
+
+			skcipher_request_free(subreq);
+			return ret;
+		}
+	}
 
 	rctx->mode = mode;
 
-	return mtk_handle_queue(mtk, req);
+	spin_lock_irqsave(&mtk->lock, flags);
+	if (mtk->count >= MTK_QUEUE_LENGTH) {
+		spin_unlock_irqrestore(&mtk->lock, flags);
+		dev_warn_ratelimited(mtk->dev, "HW queue full, returning busy\n");
+		return -EBUSY;
+	}
+	mtk->count++;
+	dev_dbg(mtk->dev, "Queued request, count: %u", mtk->count);
+	spin_unlock_irqrestore(&mtk->lock, flags);
+
+	return mtk_aes_xmit(req);
 }
 
-/* ********************** ALG API ************************************ */
-
-static int mtk_aes_setkey(struct crypto_ablkcipher *tfm, const u8 *key,
-			   unsigned int keylen)
+static int mtk_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
+			  unsigned int keylen)
 {
-	struct mtk_aes_ctx *ctx = crypto_ablkcipher_ctx(tfm);
+	struct mtk_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct mtk_dev *mtk;
 	int ret;
 
-	if (keylen != AES_KEYSIZE_128 &&
-	    keylen != AES_KEYSIZE_192 &&
-	    keylen != AES_KEYSIZE_256) {
-		crypto_ablkcipher_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
+	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
+	    keylen != AES_KEYSIZE_256)
 		return -EINVAL;
-		}
+
+	mtk = mtk_aes_find_dev(ctx);
+	if (!mtk)
+		return -ENODEV;
+
+	dev_dbg(mtk->dev, "Setting %u-bit AES key", keylen * 8);
 
 	memcpy(ctx->key, key, keylen);
 	ctx->keylen = keylen;
 
-	ctx->phy_key = dma_map_single(NULL, (void *)ctx->key, ctx->keylen,
-			 DMA_BIDIRECTIONAL);
+	if (ctx->phy_key)
+		dma_unmap_single(mtk->dev, ctx->phy_key, ctx->keylen,
+				 DMA_TO_DEVICE);
 
-	dma_unmap_single(NULL, (dma_addr_t)ctx->phy_key, ctx->keylen,
-			 DMA_TO_DEVICE);
+	ctx->phy_key = dma_map_single(mtk->dev, ctx->key, ctx->keylen,
+				      DMA_TO_DEVICE);
+	if (dma_mapping_error(mtk->dev, ctx->phy_key)) {
+		dev_err(mtk->dev, "Failed to DMA map key\n");
+		ctx->phy_key = 0;
+		return -ENOMEM;
+	}
 
 	crypto_skcipher_clear_flags(ctx->fallback, CRYPTO_TFM_REQ_MASK);
 	crypto_skcipher_set_flags(ctx->fallback, tfm->base.crt_flags &
-						 CRYPTO_TFM_REQ_MASK);
+					      CRYPTO_TFM_REQ_MASK);
 
 	ret = crypto_skcipher_setkey(ctx->fallback, key, keylen);
+	if (ret) {
+		dev_err(mtk->dev, "Fallback setkey failed: %d\n", ret);
+		dma_unmap_single(mtk->dev, ctx->phy_key, ctx->keylen,
+				 DMA_TO_DEVICE);
+		ctx->phy_key = 0;
+	}
 
-	return 0;
+	return ret;
 }
 
-static int mtk_aes_ecb_encrypt(struct ablkcipher_request *req)
+static int mtk_aes_ecb_encrypt(struct skcipher_request *req)
 {
 	return mtk_aes_crypt(req, CRYPTO_MODE_ENC);
 }
 
-static int mtk_aes_ecb_decrypt(struct ablkcipher_request *req)
+static int mtk_aes_ecb_decrypt(struct skcipher_request *req)
 {
 	return mtk_aes_crypt(req, 0);
 }
 
-static int mtk_aes_cbc_encrypt(struct ablkcipher_request *req)
+static int mtk_aes_cbc_encrypt(struct skcipher_request *req)
 {
 	return mtk_aes_crypt(req, CRYPTO_MODE_ENC | CRYPTO_MODE_CBC);
 }
 
-static int mtk_aes_cbc_decrypt(struct ablkcipher_request *req)
+static int mtk_aes_cbc_decrypt(struct skcipher_request *req)
 {
 	return mtk_aes_crypt(req, CRYPTO_MODE_CBC);
 }
 
 static int mtk_aes_cra_init(struct crypto_tfm *tfm)
 {
-	const char *name = crypto_tfm_alg_name(tfm);
-	const u32 flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_NEED_FALLBACK;
 	struct mtk_aes_ctx *ctx = crypto_tfm_ctx(tfm);
+	const char *name = crypto_tfm_alg_name(tfm);
 
-	struct crypto_skcipher *blk;
+	ctx->fallback = crypto_alloc_skcipher(name, 0, CRYPTO_ALG_NEED_FALLBACK);
+	if (IS_ERR(ctx->fallback)) {
+		pr_err("mtk-aes: Failed to allocate fallback for %s\n", name);
+		return PTR_ERR(ctx->fallback);
+	}
 
-	blk = crypto_alloc_skcipher(name, 0, flags);
-
-	if (IS_ERR(blk))
-		return PTR_ERR(blk);
-
-	ctx->fallback = blk;
-
-	tfm->crt_ablkcipher.reqsize = sizeof(struct mtk_aes_reqctx);
-
+	crypto_tfm_set_flags(tfm, CRYPTO_TFM_REQ_FORBID_WEAK_KEYS);
+	crypto_skcipher_set_reqsize(__crypto_skcipher_cast(tfm),
+				    sizeof(struct mtk_aes_reqctx));
 	return 0;
 }
 
 static void mtk_aes_cra_exit(struct crypto_tfm *tfm)
 {
 	struct mtk_aes_ctx *ctx = crypto_tfm_ctx(tfm);
-
-	if (ctx->fallback)
-		crypto_free_skcipher(ctx->fallback);
-
-	ctx->fallback = NULL;
+	crypto_free_skcipher(ctx->fallback);
 }
 
-/* ********************** ALGS ************************************ */
-
-static struct crypto_alg aes_algs[] = {
-{
-	.cra_name		= "cbc(aes)",
-	.cra_driver_name	= "cbc-aes-mt7628",
-	.cra_priority		= 300,
-	.cra_flags		= CRYPTO_ALG_ASYNC | CRYPTO_ALG_NEED_FALLBACK |
-				  CRYPTO_ALG_TYPE_ABLKCIPHER,
-	.cra_blocksize		= AES_BLOCK_SIZE,
-	.cra_ctxsize		= sizeof(struct mtk_aes_ctx),
-	.cra_alignmask		= 0xf,
-	.cra_type		= &crypto_ablkcipher_type,
-	.cra_module		= THIS_MODULE,
-	.cra_init		= mtk_aes_cra_init,
-	.cra_exit		= mtk_aes_cra_exit,
-	.cra_u.ablkcipher = {
-		.setkey		= mtk_aes_setkey,
-		.encrypt	= mtk_aes_cbc_encrypt,
-		.decrypt	= mtk_aes_cbc_decrypt,
-		.min_keysize	= AES_MIN_KEY_SIZE,
-		.max_keysize	= AES_MAX_KEY_SIZE,
-		.ivsize		= AES_BLOCK_SIZE,
-		}
-},
-{
-	.cra_name		= "ecb(aes)",
-	.cra_driver_name	= "ecb-aes-mt7628",
-	.cra_priority		= 300,
-	.cra_flags		= CRYPTO_ALG_ASYNC | CRYPTO_ALG_NEED_FALLBACK |
-				  CRYPTO_ALG_TYPE_ABLKCIPHER,
-	.cra_blocksize		= AES_BLOCK_SIZE,
-	.cra_ctxsize		= sizeof(struct mtk_aes_ctx),
-	.cra_alignmask		= 0xf,
-	.cra_type		= &crypto_ablkcipher_type,
-	.cra_module		= THIS_MODULE,
-	.cra_init		= mtk_aes_cra_init,
-	.cra_exit		= mtk_aes_cra_exit,
-	.cra_type		= &crypto_ablkcipher_type,
-	.cra_u.ablkcipher = {
-		.setkey		= mtk_aes_setkey,
-		.encrypt	= mtk_aes_ecb_encrypt,
-		.decrypt	= mtk_aes_ecb_decrypt,
-		.min_keysize	= AES_MIN_KEY_SIZE,
-		.max_keysize	= AES_MAX_KEY_SIZE,
-		}
-},
+static struct skcipher_alg crypto_algs[] = {
+	{
+		.base.cra_name		= "cbc(aes)",
+		.base.cra_driver_name	= "mtk-aes-cbc",
+		.base.cra_priority	= 300,
+		.base.cra_flags		= CRYPTO_ALG_ASYNC |
+					  CRYPTO_ALG_NEED_FALLBACK,
+		.base.cra_blocksize	= AES_BLOCK_SIZE,
+		.base.cra_ctxsize	= sizeof(struct mtk_aes_ctx),
+		.base.cra_alignmask	= 0,
+		.base.cra_module	= THIS_MODULE,
+		.init			= mtk_aes_cra_init,
+		.exit			= mtk_aes_cra_exit,
+		.min_keysize		= AES_MIN_KEY_SIZE,
+		.max_keysize		= AES_MAX_KEY_SIZE,
+		.setkey			= mtk_aes_setkey,
+		.encrypt		= mtk_aes_cbc_encrypt,
+		.decrypt		= mtk_aes_cbc_decrypt,
+	},
+	{
+		.base.cra_name		= "ecb(aes)",
+		.base.cra_driver_name	= "mtk-aes-ecb",
+		.base.cra_priority	= 300,
+		.base.cra_flags		= CRYPTO_ALG_ASYNC |
+					  CRYPTO_ALG_NEED_FALLBACK,
+		.base.cra_blocksize	= AES_BLOCK_SIZE,
+		.base.cra_ctxsize	= sizeof(struct mtk_aes_ctx),
+		.base.cra_alignmask	= 0,
+		.base.cra_module	= THIS_MODULE,
+		.init			= mtk_aes_cra_init,
+		.exit			= mtk_aes_cra_exit,
+		.min_keysize		= AES_MIN_KEY_SIZE,
+		.max_keysize		= AES_MAX_KEY_SIZE,
+		.setkey			= mtk_aes_setkey,
+		.encrypt		= mtk_aes_ecb_encrypt,
+		.decrypt		= mtk_aes_ecb_decrypt,
+	},
 };
 
-int mtk_cipher_alg_register(struct mtk_dev *mtk)
+static int mtk_cipher_alg_register(struct mtk_dev *mtk)
 {
-	int err, i;
+	int err;
 
 	INIT_LIST_HEAD(&mtk->aes_list);
 	spin_lock_init(&mtk->lock);
@@ -666,115 +534,135 @@ int mtk_cipher_alg_register(struct mtk_dev *mtk)
 	list_add_tail(&mtk->aes_list, &mtk_aes.dev_list);
 	spin_unlock(&mtk_aes.lock);
 
-	for (i = 0; i < ARRAY_SIZE(aes_algs); i++) {
-		dev_info(mtk->dev, "Register: %s\n", aes_algs[i].cra_name);
-		err = crypto_register_alg(&aes_algs[i]);
-		if (err)
-			goto err_aes_algs;
+	err = crypto_register_skciphers(crypto_algs, ARRAY_SIZE(crypto_algs));
+	if (err) {
+		dev_err(mtk->dev, "Could not register algorithms: %d\n", err);
+		list_del(&mtk->aes_list);
+		return err;
 	}
+	dev_info(mtk->dev, "Cipher algorithms registered");
 	return 0;
-
-err_aes_algs:
-	for (; i--; )
-		crypto_unregister_alg(&aes_algs[i]);
-
-	return err;
 }
 
-void mtk_cipher_alg_release(struct mtk_dev *mtk)
+static void mtk_cipher_alg_release(struct mtk_dev *mtk)
 {
-	int i;
-
+	dev_dbg(mtk->dev, "Unregistering cipher algorithms...");
 	spin_lock(&mtk_aes.lock);
 	list_del(&mtk->aes_list);
 	spin_unlock(&mtk_aes.lock);
-
-	for (i = 0; i < ARRAY_SIZE(aes_algs); i++)
-		crypto_unregister_alg(&aes_algs[i]);
+	crypto_unregister_skciphers(crypto_algs, ARRAY_SIZE(crypto_algs));
 }
-
-/* Probe using Device Tree; needs helper for loading on earlier DTS firmware */
 
 static int mtk_aes_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct mtk_dev *mtk;
-	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	struct resource *res;
 	int ret;
 
 	mtk = devm_kzalloc(dev, sizeof(*mtk), GFP_KERNEL);
 	if (!mtk)
 		return -ENOMEM;
 
-	mtk->base = devm_ioremap_resource(dev, res);
-	if (IS_ERR(mtk->base))
-		return PTR_ERR(mtk->base);
-
 	mtk->dev = dev;
+	platform_set_drvdata(pdev, mtk);
 
-	aes_engine_reset(); // force reset and clk enable
+	dev_info(dev, "Probing MediaTek AES accelerator...");
 
-	dev_info(dev, "HW verson: %02X\n", readl(mtk->base + AES_INFO) >> 28);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	mtk->base = devm_ioremap_resource(dev, res);
+	if (IS_ERR(mtk->base)) {
+		dev_err(dev, "Failed to ioremap registers\n");
+		return PTR_ERR(mtk->base);
+	}
+	dev_dbg(dev, "Registers mapped to %p", mtk->base);
+
+	mtk->rstc = devm_reset_control_get_exclusive(dev, "cryp");
+	if (IS_ERR(mtk->rstc)) {
+		dev_err(dev, "Failed to get crypto reset controller\n");
+		return PTR_ERR(mtk->rstc);
+	}
+	dev_dbg(dev, "Acquired reset controller");
+
+	mtk->clk = devm_clk_get(dev, "cryp");
+	if (IS_ERR(mtk->clk)) {
+		dev_err(dev, "Failed to get crypto clock\n");
+		return PTR_ERR(mtk->clk);
+	}
+	dev_dbg(dev, "Acquired clock");
+
+	ret = clk_prepare_enable(mtk->clk);
+	if (ret) {
+		dev_err(dev, "Failed to enable clock: %d\n", ret);
+		return ret;
+	}
+	dev_dbg(dev, "Clock enabled");
+
+	dev_dbg(dev, "Performing hardware reset...");
+	reset_control_assert(mtk->rstc);
+	udelay(10);
+	reset_control_deassert(mtk->rstc);
+	dev_dbg(dev, "Hardware reset complete");
+
+	dev_info(dev, "HW version: 0x%02X", readl(mtk->base + AES_INFO) >> 28);
 
 	mtk->irq = platform_get_irq(pdev, 0);
 	if (mtk->irq < 0) {
-		dev_err(dev, "Cannot get IRQ resource\n");
-		return mtk->irq;
+		dev_err(dev, "Failed to get IRQ number\n");
+		ret = mtk->irq;
+		goto err_clk_disable;
 	}
 
-	ret = devm_request_threaded_irq(mtk->dev, mtk->irq, mtk_aes_irq,
-					NULL, IRQF_ONESHOT,
-					dev_name(mtk->dev), mtk);
-
+	ret = devm_request_irq(dev, mtk->irq, mtk_aes_irq, 0, dev_name(dev), mtk);
 	if (ret) {
-		dev_err(mtk->dev, "Cannot grab IRQ\n");
-		return ret;
+		dev_err(dev, "Failed to request IRQ %d: %d\n", mtk->irq, ret);
+		goto err_clk_disable;
 	}
-	dev_info(mtk->dev, "IRQ %d assigned to handler", mtk->irq);
+	dev_info(dev, "Registered IRQ %d", mtk->irq);
 
-	/* Hardcoded Clk at the moment
-	mtk->clk = devm_clk_get(dev, "crypto");
-			if (IS_ERR(mtk->clk)) {
-				mtk->clk = NULL;
-				dev_err(dev, "Could not find clock\n");
-			}
-	*/
-	mtk->clk = NULL;
-
-	tasklet_init(&mtk->done_tasklet, mtk_tasklet_req_done,
-		     (unsigned long)mtk);
-
-	/* Allocate descriptor rings */
+	tasklet_setup(&mtk->done_tasklet, mtk_tasklet_req_done);
 
 	ret = aes_engine_desc_init(mtk);
-
-	/* Register Ciphers */
+	if (ret) {
+		dev_err(dev, "Failed to initialize descriptors\n");
+		goto err_tasklet_kill;
+	}
 
 	ret = mtk_cipher_alg_register(mtk);
+	if (ret)
+		goto err_desc_free;
 
-	aes_engine_start(mtk); // Start hw engine
+	aes_engine_start(mtk);
 
-	platform_set_drvdata(pdev, mtk);
-
-	dev_info(dev, "Initialized.\n");
-
+	dev_info(dev, "MTK AES driver initialized successfully.\n");
 	return 0;
+
+err_desc_free:
+	aes_engine_desc_free(mtk);
+err_tasklet_kill:
+	tasklet_kill(&mtk->done_tasklet);
+err_clk_disable:
+	clk_disable_unprepare(mtk->clk);
+	dev_err(dev, "Probe failed with error %d\n", ret);
+	return ret;
 }
 
-static int __exit mtk_aes_remove(struct platform_device *pdev)
+static int mtk_aes_remove(struct platform_device *pdev)
 {
 	struct mtk_dev *mtk = platform_get_drvdata(pdev);
 
 	if (!mtk)
 		return -ENODEV;
 
-	tasklet_kill(&mtk->done_tasklet);
+	dev_info(mtk->dev, "Unloading MTK AES driver...");
+
 	aes_engine_stop(mtk);
+	tasklet_kill(&mtk->done_tasklet);
 	mtk_cipher_alg_release(mtk);
 	aes_engine_desc_free(mtk);
-	dev_info(mtk->dev, "Unloaded.\n");
-	platform_set_drvdata(pdev, NULL);
+	clk_disable_unprepare(mtk->clk);
 
+	dev_info(mtk->dev, "Driver unloaded.");
 	return 0;
 }
 
@@ -782,7 +670,6 @@ static const struct of_device_id of_crypto_id[] = {
 	{ .compatible = "mediatek,mtk-aes" },
 	{},
 };
-
 MODULE_DEVICE_TABLE(of, of_crypto_id);
 
 static struct platform_driver mt76x8_aes_driver = {
@@ -797,6 +684,6 @@ static struct platform_driver mt76x8_aes_driver = {
 module_platform_driver(mt76x8_aes_driver);
 
 MODULE_AUTHOR("Richard van Schagen <vschagen@cs.com>");
-MODULE_DESCRIPTION("Mediatek AES Crypto hardware driver");
+MODULE_AUTHOR("Daniel Golle <daniel@makrotopia.org>");
+MODULE_DESCRIPTION("MediaTek AES Crypto hardware driver (updated for 6.x)");
 MODULE_LICENSE("GPL");
-
